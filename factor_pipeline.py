@@ -305,13 +305,8 @@ class FactorPipeline:
         if not records:
             return pd.DataFrame()
 
-        matrix = pd.DataFrame({str(d): s for d, s in records})
-        matrix = matrix.T
-        matrix.index = pd.to_datetime(matrix.index)
-        matrix.index.name = "date"
-        return matrix
-
-        matrix = pd.DataFrame({str(d): s for d, s in records})
+        # 统一使用月末日期作为索引
+        matrix = pd.DataFrame({d.strftime("%Y-%m-%d"): s for d, s in records})
         matrix = matrix.T
         matrix.index = pd.to_datetime(matrix.index)
         matrix.index.name = "date"
@@ -320,33 +315,30 @@ class FactorPipeline:
     def _calc_forward_returns(
         self, price_df: pd.DataFrame, hold_days: int = 20
     ) -> pd.DataFrame:
-        """
-        计算未来 N 日收益
-
-        按月频输出，用于与因子值匹配
-        """
+        """计算未来 N 日收益（按月频，月末对齐 _build_factor_matrix）"""
         df = price_df.sort_values(["stock_code", "date"]).copy()
-
-        # 未来收益
         df["fwd_ret"] = df.groupby("stock_code")["close"].transform(
             lambda x: x.shift(-hold_days) / x - 1
         )
 
-        # 按月度取截面
+        # 取每个月最后一个交易日
         df["year_month"] = df["date"].dt.to_period("M")
-        monthly = df.groupby("year_month")
+        month_last = df.groupby("year_month").apply(
+            lambda g: g.loc[g.groupby("stock_code")["date"].idxmax()]
+        ).reset_index(drop=True)
 
         records = []
-        for ym, group in monthly:
-            latest = group.sort_values("date").groupby("stock_code").last()
-            rets = latest["fwd_ret"].dropna()
+        for ym, group in month_last.groupby("year_month"):
+            rets = group.set_index("stock_code")["fwd_ret"].dropna()
             if not rets.empty:
-                records.append((ym.to_timestamp(), rets))
+                # 用该月最后一个交易日作为日期索引
+                last_date = group["date"].max()
+                records.append((last_date, rets))
 
         if not records:
             return pd.DataFrame()
 
-        matrix = pd.DataFrame({str(d): s for d, s in records})
+        matrix = pd.DataFrame({d.strftime("%Y-%m-%d"): s for d, s in records})
         matrix = matrix.T
         matrix.index = pd.to_datetime(matrix.index)
         matrix.index.name = "date"
