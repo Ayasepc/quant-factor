@@ -15,43 +15,40 @@ from . import BaseFactor
 # ═══════════════════════════════════════════
 
 class PE_TTM(BaseFactor):
-    """市盈率 TTM: 市值 / 近12个月净利润"""
+    """市盈率 TTM: 价格 / TTM每股收益"""
 
     def __init__(self):
         super().__init__(name="PE_TTM", category="valuation", direction=-1)
 
     def calculate(self, price_df, fin_df=None):
-        """
-        使用行情数据 + 财务数据计算
-        PE = 总市值 / 净利润(TTM)
-        """
+        if "pe_ttm" in price_df.columns:
+            return price_df.groupby("stock_code")["pe_ttm"].last().dropna()
         if "pe" in price_df.columns:
             return price_df.groupby("stock_code")["pe"].last()
-        raise ValueError("缺少 PE 数据，请先获取估值数据")
+        raise ValueError("缺少 PE 数据，请先 enrich_with_financial_data")
 
 
 class PB(BaseFactor):
-    """市净率: 市值 / 净资产"""
+    """市净率: 价格 / 每股净资产"""
 
     def __init__(self):
         super().__init__(name="PB", category="valuation", direction=-1)
 
     def calculate(self, price_df, fin_df=None):
         if "pb" in price_df.columns:
-            return price_df.groupby("stock_code")["pb"].last()
-        raise ValueError("缺少 PB 数据")
+            return price_df.groupby("stock_code")["pb"].last().dropna()
+        raise ValueError("缺少 PB 数据，请先 enrich_with_financial_data")
 
 
 class PS_TTM(BaseFactor):
-    """市销率 TTM: 市值 / 营业收入 TTM"""
+    """市销率 TTM: 价格 / 每股营业收入 TTM"""
 
     def __init__(self):
         super().__init__(name="PS_TTM", category="valuation", direction=-1)
 
     def calculate(self, price_df, fin_df=None):
-        # 从行情数据获取 PS 估值
         if "ps" in price_df.columns:
-            return price_df.groupby("stock_code")["ps"].last()
+            return price_df.groupby("stock_code")["ps"].last().dropna()
         raise ValueError("缺少 PS 数据")
 
 
@@ -68,6 +65,8 @@ class ROE(BaseFactor):
         super().__init__(name="ROE", category="quality", direction=1)
 
     def calculate(self, price_df, fin_df=None):
+        if "roe" in price_df.columns:
+            return price_df.groupby("stock_code")["roe"].last().dropna()
         if fin_df is not None and "roe" in fin_df.columns:
             return fin_df.groupby("stock_code")["roe"].last()
         raise ValueError("缺少 ROE 数据")
@@ -80,6 +79,8 @@ class ROA(BaseFactor):
         super().__init__(name="ROA", category="quality", direction=1)
 
     def calculate(self, price_df, fin_df=None):
+        if "roa" in price_df.columns:
+            return price_df.groupby("stock_code")["roa"].last().dropna()
         if fin_df is not None and "roa" in fin_df.columns:
             return fin_df.groupby("stock_code")["roa"].last()
         raise ValueError("缺少 ROA 数据")
@@ -92,13 +93,9 @@ class GrossMargin(BaseFactor):
         super().__init__(name="GrossMargin", category="quality", direction=1)
 
     def calculate(self, price_df, fin_df=None):
-        if fin_df is None:
-            raise ValueError("毛利率计算需要财务数据")
-        revenue = fin_df.get("revenue", np.nan)
-        cost = fin_df.get("cost", np.nan)
-        if pd.isna(revenue) or pd.isna(cost) or revenue == 0:
-            return np.nan
-        return (revenue - cost) / revenue
+        if "gross_margin" in price_df.columns:
+            return price_df.groupby("stock_code")["gross_margin"].last().dropna()
+        raise ValueError("缺少毛利率数据")
 
 
 class NetMargin(BaseFactor):
@@ -108,13 +105,9 @@ class NetMargin(BaseFactor):
         super().__init__(name="NetMargin", category="quality", direction=1)
 
     def calculate(self, price_df, fin_df=None):
-        if fin_df is None:
-            raise ValueError("净利率计算需要财务数据")
-        profit = fin_df.get("net_profit", np.nan)
-        revenue = fin_df.get("revenue", np.nan)
-        if pd.isna(profit) or pd.isna(revenue) or revenue == 0:
-            return np.nan
-        return profit / revenue
+        if "net_margin" in price_df.columns:
+            return price_df.groupby("stock_code")["net_margin"].last().dropna()
+        raise ValueError("缺少净利率数据")
 
 
 # ═══════════════════════════════════════════
@@ -128,6 +121,8 @@ class RevenueGrowth(BaseFactor):
         super().__init__(name="RevYoY", category="growth", direction=1)
 
     def calculate(self, price_df, fin_df=None):
+        if "revenue_yoy" in price_df.columns:
+            return price_df.groupby("stock_code")["revenue_yoy"].last().dropna()
         if fin_df is not None and "revenue_yoy" in fin_df.columns:
             return fin_df.groupby("stock_code")["revenue_yoy"].last()
         raise ValueError("缺少营收增长率数据")
@@ -140,6 +135,9 @@ class ProfitGrowth(BaseFactor):
         super().__init__(name="ProfitYoY", category="growth", direction=1)
 
     def calculate(self, price_df, fin_df=None):
+        if "profit_yoy" in price_df.columns or "net_profit_yoy" in price_df.columns:
+            col = "profit_yoy" if "profit_yoy" in price_df.columns else "net_profit_yoy"
+            return price_df.groupby("stock_code")[col].last().dropna()
         if fin_df is not None and "profit_yoy" in fin_df.columns:
             return fin_df.groupby("stock_code")["profit_yoy"].last()
         raise ValueError("缺少净利润增长率数据")

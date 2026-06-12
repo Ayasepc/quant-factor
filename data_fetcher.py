@@ -63,36 +63,67 @@ class AStockDataFetcher:
         df.to_parquet(cache_path)
         return df
 
+    @staticmethod
+    def _code_to_sina_symbol(code: str) -> str:
+        """将6位股票代码转为新浪前缀格式"""
+        if code.startswith("6") or code.startswith("9"):
+            return f"sh{code}"
+        elif code.startswith("0") or code.startswith("3") or code.startswith("2"):
+            return f"sz{code}"
+        elif code.startswith("4") or code.startswith("8"):
+            return f"bj{code}"
+        return code
+
     @retry(max_attempts=3)
     def get_daily_price(
         self, stock_code: str, start_date: str, end_date: str,
         use_cache: bool = True
     ) -> pd.DataFrame:
-        """获取个股日线行情 (带缓存)"""
+        """获取个股日线行情 (带缓存，使用新浪接口)"""
         cache_path = os.path.join(
             self.cache_dir, f"price_{stock_code}_{start_date}_{end_date}.parquet"
         )
         if use_cache and os.path.exists(cache_path):
             return pd.read_parquet(cache_path)
 
-        df = ak.stock_zh_a_hist(
-            symbol=stock_code,
-            period="daily",
-            start_date=start_date.replace("-", ""),
-            end_date=end_date.replace("-", ""),
-            adjust="qfq",
-        )
+        try:
+            symbol = self._code_to_sina_symbol(stock_code)
+            df = ak.stock_zh_a_daily(
+                symbol=symbol,
+                start_date=start_date.replace("-", ""),
+                end_date=end_date.replace("-", ""),
+                adjust="qfq",
+            )
+        except Exception:
+            # 回退到东方财富接口
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    adjust="qfq",
+                )
+            except Exception as e:
+                raise e
+
         if df.empty:
             return pd.DataFrame()
 
-        df.columns = [
-            "date", "stock_code", "open", "close", "high", "low",
-            "volume", "amount", "amplitude", "pct_change",
-            "change", "turnover",
-        ]
-        df["date"] = pd.to_datetime(df["date"])
-        # API 已返回 stock_code，确保统一
+        # 统一列名（新浪接口列名不同）
         df["stock_code"] = stock_code
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.rename(columns={
+            "volume": "volume",
+            "outstanding_share": "outstanding_share",
+        })
+        # 计算涨跌幅
+        df["pct_change"] = df.groupby("stock_code")["close"].transform("pct_change") * 100
+        df["pct_change"] = df["pct_change"].fillna(0)
+        # 计算振幅
+        df["amplitude"] = (df["high"] - df["low"]) / df["low"] * 100
+        # 计算涨跌额
+        df["change"] = df["close"] - df["open"]
 
         if use_cache:
             df.to_parquet(cache_path)
@@ -201,6 +232,150 @@ class AStockDataFetcher:
         return result
 
     # ──────────────────────────────────────────
+    # 4. 财务数据增强 (合并到行情DataFrame)
+    # ──────────────────────────────────────────
+
+    def enrich_with_financial_data(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        获取财务指标并合并到行情数据中
+
+        为每个股票获取季度财务报告，前向填充到每个交易日，
+        合并为带财务指标的完整DataFrame
+
+        Returns:
+            新增列: roe, roa, gross_margin, net_margin,
+                    eps_ttm, bvps, pe_ttm, pb,
+                    revenue_yoy, profit_yoy
+        """
+        stock_codes = price_df["stock_code"].unique()
+        print(f"\n[财务] 获取 {len(stock_codes)} 只股票的财务数据...")
+        all_parts = []
+
+        for i, code in enumerate(stock_codes, 1):
+            stock_data = price_df[price_df["stock_code"] == code].sort_values("date").copy()
+            try:
+                fin_raw = self.get_financial_indicators(code)
+                if fin_raw.empty:
+                    all_parts.append(stock_data)
+                    continue
+
+                fin_ts = self._parse_financial_to_ts(fin_raw)
+                if fin_ts.empty:
+                    all_parts.append(stock_data)
+                    continue
+
+                # 使用 merge_asof 前向填充：每个交易日取最新季度数据
+                merged = pd.merge_asof(
+                    stock_data,
+                    fin_ts.sort_values("report_date"),
+                    left_on="date",
+                    right_on="report_date",
+                    direction="backward",
+                )
+                # 计算 PE/PB 等衍生指标
+                merged = self._calc_derived_factors(merged)
+                # 删除冗余字段
+                for col in ["report_date", "eps", "revenue", "net_profit"]:
+                    if col in merged.columns:
+                        merged.drop(columns=[col], inplace=True)
+
+                all_parts.append(merged)
+                print(f"  [财务/{i}/{len(stock_codes)}] {code} ✅")
+            except Exception as e:
+                all_parts.append(stock_data)
+                print(f"  [财务/{i}/{len(stock_codes)}] {code} ⚠️ {type(e).__name__}")
+                continue
+
+        result = pd.concat(all_parts, ignore_index=True)
+        print(f"  [财务] 已合并: {result.shape[0]} 行, {result.shape[1]} 列")
+        return result
+
+    def _parse_financial_to_ts(self, fin_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        将 stock_financial_abstract 转为时间序列
+        返回: DataFrame(report_date, roe, roa, gross_margin, net_margin,
+                        eps, bvps, revenue, net_profit)
+        """
+        ind_map = {}
+        for _, row in fin_df.iterrows():
+            ind_map[row["指标"]] = row
+
+        date_cols = [c for c in fin_df.columns if c not in ["选项", "指标"]]
+        date_cols = sorted(date_cols)
+
+        records = []
+        prev_row = {}  # 上一期的财务数，用于计算TTM
+
+        for date_str in date_cols:
+            date = pd.to_datetime(date_str)
+            rec = {"report_date": date}
+
+            for key, col_name in [
+                ("roe", "净资产收益率(ROE)"),
+                ("roa", "总资产报酬率(ROA)"),
+                ("gross_margin", "毛利率"),
+                ("net_margin", "销售净利率"),
+                ("eps", "基本每股收益"),
+                ("bvps", "每股净资产"),
+            ]:
+                if col_name in ind_map:
+                    rec[key] = self._safe_float(ind_map[col_name].get(date_str, None))
+
+            # 净利润和营收（用于 YoY 计算）
+            for key, col_name in [("net_profit", "净利润"), ("revenue", "营业总收入")]:
+                if col_name in ind_map:
+                    rec[key] = self._safe_float(ind_map[col_name].get(date_str, None))
+
+            # 计算 YoY 增长率（与上年同期对比）
+            for key in ["revenue", "net_profit"]:
+                if key in rec and key in prev_row:
+                    prev_val = prev_row.get(key)
+                    curr_val = rec[key]
+                    if prev_val and prev_val != 0 and curr_val is not None:
+                        rec[f"{key}_yoy"] = (curr_val / prev_val - 1) * 100
+
+            records.append(rec)
+            prev_row = rec.copy()  # 存作下期对比基准（简化为同比）
+
+        if not records:
+            return pd.DataFrame()
+
+        ts = pd.DataFrame(records)
+
+        # 计算 TTM EPS（最近4个季度的EPS之和）
+        ts["eps_ttm"] = ts["eps"].rolling(4, min_periods=1).sum()
+        # 若无4期数据，用年化估算
+        mask = ts["eps_ttm"].isna()
+        if mask.any():
+            for idx in ts[mask].index:
+                q = len(ts) - idx  # 可用期数
+                if ts.loc[idx, "eps"] and q > 0:
+                    ts.loc[idx, "eps_ttm"] = ts.loc[idx, "eps"] * (4 / max(q, 1))
+
+        return ts
+
+    @staticmethod
+    def _calc_derived_factors(df: pd.DataFrame) -> pd.DataFrame:
+        """从基础数据计算 PE/PB 等衍生因子"""
+        # PE_TTM = 价格 / TTM每股收益
+        if "eps_ttm" in df.columns and "close" in df.columns:
+            eps = df["eps_ttm"].replace(0, np.nan)
+            df["pe_ttm"] = df["close"] / eps
+
+        # PB = 价格 / 每股净资产
+        if "bvps" in df.columns and "close" in df.columns:
+            bv = df["bvps"].replace(0, np.nan)
+            df["pb"] = df["close"] / bv
+
+        # 营收增长率重命名
+        if "revenue_yoy" in df.columns:
+            df["revenue_yoy"] = df["revenue_yoy"]
+        if "net_profit_yoy" in df.columns:
+            df["profit_yoy"] = df["net_profit_yoy"]
+
+        return df
+
+    # ──────────────────────────────────────────
     # 内部辅助
     # ──────────────────────────────────────────
 
@@ -214,3 +389,11 @@ class AStockDataFetcher:
             except (ValueError, TypeError):
                 return np.nan
         return np.nan
+
+    @staticmethod
+    def _safe_float(val) -> float:
+        """安全转 float，失败返回 nan"""
+        try:
+            return float(val) if val is not None and val != "" else np.nan
+        except (ValueError, TypeError):
+            return np.nan

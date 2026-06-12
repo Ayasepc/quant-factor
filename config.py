@@ -2,8 +2,8 @@
 
 # 回测参数
 BACKTEST_CONFIG = {
-    "start_date": "2020-01-01",
-    "end_date": "2025-12-31",
+    "start_date": "2023-01-01",
+    "end_date": "2026-06-12",
     "rebalance_freq": "monthly",  # 调仓频率
     "group_num": 10,              # 分组数量 (十分位)
     "benchmark": "000300.SH",     # 基准: 沪深300
