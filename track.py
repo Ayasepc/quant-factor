@@ -28,8 +28,9 @@ print("=" * 55)
 
 pipeline = FactorPipeline()
 price_df, stock_list = pipeline.prepare_data(
-    start_date="2023-01-01",
+    start_date="2026-01-01",
     end_date=BACKTEST_CONFIG["end_date"],
+    max_stocks=200,
     with_financial=True,
 )
 

@@ -16,8 +16,8 @@ import akshare as ak
 from config import UNIVERSE_CONFIG
 
 
-# 请求间隔（秒），避免触发 API 限流
-REQUEST_INTERVAL = 1.0
+# 请求间隔（秒），AKShare 限流约 3 次/秒
+REQUEST_INTERVAL = 0.35
 
 
 def retry(max_attempts=3, delay=2):
@@ -53,14 +53,32 @@ class AStockDataFetcher:
 
     @retry(max_attempts=3)
     def get_stock_list(self) -> pd.DataFrame:
-        """获取全A股股票列表"""
+        """获取全A股股票列表（上交所+深交所）"""
         cache_path = os.path.join(self.cache_dir, "stock_list.parquet")
         if os.path.exists(cache_path):
             return pd.read_parquet(cache_path)
 
-        df = ak.stock_info_a_code_name()
-        df.columns = ["stock_code", "stock_name"]
+        records = []
+        # 上交所
+        try:
+            sh = ak.stock_info_sh_name_code()
+            for _, r in sh.iterrows():
+                records.append({"stock_code": str(r["证券代码"]), "stock_name": r["证券简称"]})
+        except Exception:
+            pass
+        # 深交所
+        try:
+            sz = ak.stock_info_sz_name_code(symbol="A股列表")
+            for _, r in sz.iterrows():
+                records.append({"stock_code": str(r["A股代码"]), "stock_name": r["A股简称"]})
+        except Exception:
+            pass
+
+        df = pd.DataFrame(records)
+        if df.empty:
+            raise RuntimeError("无法获取股票列表，请检查网络连接")
         df.to_parquet(cache_path)
+        print(f"  股票列表: {len(df)} 只 (上证{len(sh) if 'sh' in dir() else 0} + 深证{len(sz) if 'sz' in dir() else 0})")
         return df
 
     @staticmethod

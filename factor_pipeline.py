@@ -71,44 +71,40 @@ class FactorPipeline:
 
     def prepare_data(
         self, start_date: str = None, end_date: str = None,
-        max_stocks: int = 20, with_financial: bool = True,
+        max_stocks: int = 200, with_financial: bool = True,
     ):
         """
         准备分析所需数据
 
         Args:
-            max_stocks: 演示用股票数量
+            max_stocks: 最大股票数，-1 表示全市场
             with_financial: 是否获取财务数据并合并
         """
         start = start_date or BACKTEST_CONFIG["start_date"]
         end = end_date or BACKTEST_CONFIG["end_date"]
 
-        # 直接使用银行板块股票
-        bank_stocks = [
-            "600036", "601398", "601939", "601288", "601988",  # 国有大行
-            "601328", "601166", "600016", "600000", "601009",  # 股份行+城商行
-            "002142", "601229", "601838", "600919", "601878",  # 城商行
-            "000001", "601818", "601997", "601528", "601860",  # 更多
-        ]
-        sample = bank_stocks[:max_stocks]
+        print(f"[1/3] 获取全A股股票池...")
+        full_list = self.fetcher.get_universe(end)
+        # 过滤科创板 (688) 和北交所
+        filtered = [c for c in full_list if not c.startswith("688")]
+        print(f"  全市场 {len(full_list)} 只, 过滤后 {len(filtered)} 只")
 
-        print(f"[1/3] 股票池: {len(sample)} 只银行股")
+        if max_stocks > 0:
+            sample = filtered[:max_stocks]
+            print(f"  取前 {len(sample)} 只作为样本")
+        else:
+            sample = filtered
+            print(f"  全市场选股: {len(sample)} 只")
+
         print(f"[2/3] 获取行情数据 ({start} ~ {end})...")
         price_df = self.fetcher.get_all_daily_price(
             start, end, sample, max_stocks=-1,
         )
-
         if not price_df.empty and with_financial:
             print(f"[2.5/3] 获取财务数据并合并...")
             price_df = self.fetcher.enrich_with_financial_data(price_df)
-            fin_cols = [c for c in price_df.columns if c not in
-                        ["date", "stock_code", "open", "close", "high", "low",
-                         "volume", "amount", "amplitude", "pct_change", "change",
-                         "turnover", "outstanding_share"]]
-            if fin_cols:
-                print(f"  [财务] 新增列: {fin_cols}")
 
-        print(f"[3/3] 数据准备完成: {price_df.shape[0]} 行 × {price_df.shape[1]} 列")
+        print(f"[3/3] 数据准备完成: {price_df.shape[0]} 行 × {price_df.shape[1]} 列 ({len(sample)} 只股票)")
         return price_df, sample
 
     # ═══════════════════════════════════════════
