@@ -26,6 +26,15 @@ from factors.momentum import (
     Momentum1M, Momentum3M, Momentum6M,
     Volatility20D, Turnover20D, Alpha60D,
 )
+from factors.sector import (
+    SectorBoardMomentum,
+    SectorIndexMomentum,
+)
+from factors.macro import (
+    MarketTiming,
+    USMarketCorrelation,
+    HS300Momentum,
+)
 from analyzer import FactorAnalyzer
 from multi_factor import MultiFactorModel
 
@@ -63,6 +72,13 @@ class FactorPipeline:
             "turnover_20d": Turnover20D(),
             # 技术
             "alpha_60d": Alpha60D(),
+            # 板块轮动
+            "board_momentum": SectorBoardMomentum(lookback=20),
+            "sector_rotation": SectorIndexMomentum(top_n=5),
+            # 宏观因子
+            "market_timing": MarketTiming(lookback=20),
+            "us_correlation": USMarketCorrelation(lookback=20),
+            "hs300_momentum": HS300Momentum(lookback=20),
         }
 
     # ═══════════════════════════════════════════

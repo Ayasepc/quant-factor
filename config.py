@@ -39,4 +39,13 @@ FACTOR_CONFIG = {
     "volatility_20d": {"name": "Vol20D", "category": "risk", "direction": -1},
     "turnover_20d": {"name": "Turn20D", "category": "liquidity", "direction": -1},
     "alpha_60d": {"name": "Alpha60D", "category": "momentum", "direction": 1},
+
+    # --- 板块轮动 ---
+    "board_momentum": {"name": "BoardMom20D", "category": "sector", "direction": 1},
+    "sector_rotation": {"name": "SectorRotation", "category": "sector", "direction": 1},
+
+    # --- 宏观因子 ---
+    "market_timing": {"name": "MarketAlpha20D", "category": "macro", "direction": 1},
+    "us_correlation": {"name": "USCorr20D", "category": "macro", "direction": 1},
+    "hs300_momentum": {"name": "HS300Mom20D", "category": "macro", "direction": 1},
 }

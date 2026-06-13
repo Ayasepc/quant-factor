@@ -51,34 +51,52 @@ class AStockDataFetcher:
     # 1. 股票列表 & 行情
     # ──────────────────────────────────────────
 
-    @retry(max_attempts=3)
+    @retry(max_attempts=2)
     def get_stock_list(self) -> pd.DataFrame:
-        """获取全A股股票列表（上交所+深交所）"""
+        """
+        获取全A股股票列表（沪市+深市）
+
+        通过新浪财经 API 分页获取，覆盖所有 A 股（含主板、创业板）
+        """
         cache_path = os.path.join(self.cache_dir, "stock_list.parquet")
         if os.path.exists(cache_path):
             return pd.read_parquet(cache_path)
 
         records = []
-        # 上交所
-        try:
-            sh = ak.stock_info_sh_name_code()
-            for _, r in sh.iterrows():
-                records.append({"stock_code": str(r["证券代码"]), "stock_name": r["证券简称"]})
-        except Exception:
-            pass
-        # 深交所
-        try:
-            sz = ak.stock_info_sz_name_code(symbol="A股列表")
-            for _, r in sz.iterrows():
-                records.append({"stock_code": str(r["A股代码"]), "stock_name": r["A股简称"]})
-        except Exception:
-            pass
+        import requests as req
 
-        df = pd.DataFrame(records)
+        for node in ["sh_a", "sz_a"]:
+            page = 1
+            while True:
+                url = (
+                    f"http://vip.stock.finance.sina.com.cn/quotes_service"
+                    f"/api/json_v2.php/Market_Center.getHQNodeData"
+                    f"?page={page}&num=100&sort=symbol&asc=1&node={node}"
+                )
+                try:
+                    r = req.get(url, timeout=10)
+                    data = json.loads(r.text)
+                    if not data or (isinstance(data, list) and len(data) == 0):
+                        break
+                    for item in data:
+                        records.append({
+                            "stock_code": item["code"],
+                            "stock_name": item.get("name", ""),
+                        })
+                    if len(data) < 100:
+                        break
+                    page += 1
+                    time.sleep(0.3)
+                except Exception:
+                    break
+
+        df = pd.DataFrame(records).drop_duplicates(subset="stock_code")
         if df.empty:
             raise RuntimeError("无法获取股票列表，请检查网络连接")
         df.to_parquet(cache_path)
-        print(f"  股票列表: {len(df)} 只 (上证{len(sh) if 'sh' in dir() else 0} + 深证{len(sz) if 'sz' in dir() else 0})")
+        sh_count = sum(1 for c in df["stock_code"] if c.startswith("6"))
+        sz_count = sum(1 for c in df["stock_code"] if c.startswith(("0", "3", "2")))
+        print(f"  股票列表: {len(df)} 只 (沪{sh_count} + 深{sz_count})")
         return df
 
     @staticmethod
