@@ -9,15 +9,19 @@ import time
 import json
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Callable
 from datetime import datetime, timedelta
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import akshare as ak
 from config import UNIVERSE_CONFIG
 
 
-# 请求间隔（秒），AKShare 限流约 3 次/秒
-REQUEST_INTERVAL = 0.35
+# 请求间隔（秒）
+REQUEST_INTERVAL = 0.2
+# 并发线程数（AKShare V8 引擎限制，3以下较安全）
+CONCURRENT_WORKERS = 3
 
 
 def retry(max_attempts=3, delay=2):
@@ -28,7 +32,7 @@ def retry(max_attempts=3, delay=2):
             last_err = None
             for attempt in range(1, max_attempts + 1):
                 try:
-                    time.sleep(REQUEST_INTERVAL)  # 请求间隔
+                    time.sleep(REQUEST_INTERVAL)
                     return func(*args, **kwargs)
                 except Exception as e:
                     last_err = e
@@ -38,6 +42,56 @@ def retry(max_attempts=3, delay=2):
             raise last_err
         return wrapper
     return decorator
+
+
+def _batch_fetch(codes: list, fetch_func: Callable, label: str,
+                 max_workers: int = None) -> tuple:
+    """
+    并发批量获取数据
+
+    Args:
+        codes: 待获取的股票代码列表
+        fetch_func: 单只股票获取函数 fn(code) -> DataFrame
+        label: 进度标签
+
+    Returns:
+        (成功DataFrame列表, 失败代码列表)
+    """
+    if max_workers is None:
+        max_workers = CONCURRENT_WORKERS
+
+    total = len(codes)
+    results = [None] * total
+    errors = []
+    _lock = threading.Lock()
+    _counter = [0]
+
+    def worker(idx, code):
+        try:
+            time.sleep(0.15)  # 小间隔防限流
+            df = fetch_func(code)
+            with _lock:
+                _counter[0] += 1
+                done = _counter[0]
+                if df is not None and not df.empty:
+                    results[idx] = df
+                    print(f"  [{done}/{total}] {code} ✅", flush=True)
+                else:
+                    print(f"  [{done}/{total}] {code} ⏭️", flush=True)
+        except Exception as e:
+            with _lock:
+                _counter[0] += 1
+                done = _counter[0]
+                errors.append(code)
+                print(f"  [{done}/{total}] {code} ❌ {type(e).__name__}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(worker, i, code) for i, code in enumerate(codes)]
+        for f in as_completed(futures):
+            f.result()  # 触发异常
+
+    success = [df for df in results if df is not None]
+    return success, errors
 
 
 class AStockDataFetcher:
@@ -115,63 +169,104 @@ class AStockDataFetcher:
         self, stock_code: str, start_date: str, end_date: str,
         use_cache: bool = True
     ) -> pd.DataFrame:
-        """获取个股日线行情 (带缓存，使用新浪接口)"""
-        cache_path = os.path.join(
-            self.cache_dir, f"price_{stock_code}_{start_date}_{end_date}.parquet"
-        )
-        if use_cache and os.path.exists(cache_path):
-            return pd.read_parquet(cache_path)
+        """
+        获取个股日线行情（增量缓存）
 
+        首次获取全量，后续只拉取缺失日期的新数据合并。
+        缓存文件: data/prices/{code}.parquet（累积，无日期范围）
+        """
+        prices_dir = os.path.join(self.cache_dir, "prices")
+        os.makedirs(prices_dir, exist_ok=True)
+        cache_path = os.path.join(prices_dir, f"{stock_code}.parquet")
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        # 尝试加载已有缓存
+        existing = None
+        if use_cache and os.path.exists(cache_path):
+            try:
+                existing = pd.read_parquet(cache_path)
+                existing["date"] = pd.to_datetime(existing["date"])
+                existing = existing.sort_values("date")
+            except Exception:
+                existing = None
+
+        # 确定需要获取的日期范围
+        need_fetch = True
+        if existing is not None and not existing.empty:
+            cached_min = existing["date"].min()
+            cached_max = existing["date"].max()
+
+            if cached_min <= start_dt and cached_max >= end_dt:
+                # 缓存已覆盖请求范围，直接返回子集
+                return existing[(existing["date"] >= start_dt) & (existing["date"] <= end_dt)].copy()
+            elif cached_max >= end_dt:
+                # 需要更早的数据（start_date 提前了）
+                fetch_start = start_date
+                fetch_end = (cached_min - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                # 需要更新的数据（end_date 延后了）
+                fetch_start = (cached_max + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                fetch_end = end_date
+        else:
+            fetch_start = start_date
+            fetch_end = end_date
+
+        # 拉取新数据
         try:
             symbol = self._code_to_sina_symbol(stock_code)
-            df = ak.stock_zh_a_daily(
+            new_df = ak.stock_zh_a_daily(
                 symbol=symbol,
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
+                start_date=fetch_start.replace("-", ""),
+                end_date=fetch_end.replace("-", ""),
                 adjust="qfq",
             )
         except Exception:
-            # 回退到东方财富接口
             try:
-                df = ak.stock_zh_a_hist(
+                new_df = ak.stock_zh_a_hist(
                     symbol=stock_code,
                     period="daily",
-                    start_date=start_date.replace("-", ""),
-                    end_date=end_date.replace("-", ""),
+                    start_date=fetch_start.replace("-", ""),
+                    end_date=fetch_end.replace("-", ""),
                     adjust="qfq",
                 )
             except Exception as e:
                 raise e
 
-        if df.empty:
+        if new_df.empty and existing is None:
             return pd.DataFrame()
 
-        # 统一列名（新浪接口列名不同）
-        df["stock_code"] = stock_code
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.rename(columns={
-            "volume": "volume",
-            "outstanding_share": "outstanding_share",
-        })
-        # 计算涨跌幅
-        df["pct_change"] = df.groupby("stock_code")["close"].transform("pct_change") * 100
-        df["pct_change"] = df["pct_change"].fillna(0)
-        # 计算振幅
-        df["amplitude"] = (df["high"] - df["low"]) / df["low"] * 100
-        # 计算涨跌额
-        df["change"] = df["close"] - df["open"]
+        # 合并新旧数据
+        parts = []
+        if existing is not None:
+            parts.append(existing)
+        if not new_df.empty:
+            # 统一列名
+            new_df["stock_code"] = stock_code
+            new_df["date"] = pd.to_datetime(new_df["date"])
+            # 计算衍生指标
+            new_df["pct_change"] = new_df.groupby("stock_code")["close"].transform("pct_change") * 100
+            new_df["pct_change"] = new_df["pct_change"].fillna(0)
+            new_df["amplitude"] = (new_df["high"] - new_df["low"]) / new_df["low"] * 100
+            new_df["change"] = new_df["close"] - new_df["open"]
+            parts.append(new_df)
 
-        if use_cache:
-            df.to_parquet(cache_path)
-        return df
+        combined = pd.concat(parts, ignore_index=True)
+        combined = combined.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+        # 保存完整缓存
+        combined.to_parquet(cache_path, index=False)
+
+        return combined[(combined["date"] >= start_dt) & (combined["date"] <= end_dt)].copy()
 
     def get_all_daily_price(
         self, start_date: str, end_date: str,
         stock_list: Optional[list] = None,
-        max_stocks: int = 10,  # 演示默认只取10只
+        max_stocks: int = 10,
     ) -> pd.DataFrame:
         """
-        批量获取多只股票日线行情
+        批量获取多只股票日线行情（并发版）
 
         Args:
             max_stocks: 最大股票数，-1 表示不限制
@@ -180,36 +275,60 @@ class AStockDataFetcher:
             stocks = self.get_stock_list()
             stock_list = stocks["stock_code"].tolist()
 
-        # 过滤无效代码
         stock_list = [
             c for c in stock_list
             if not (c.startswith("8") or c.startswith("4") or c.startswith("9"))
         ]
-
         if max_stocks > 0 and len(stock_list) > max_stocks:
             stock_list = stock_list[:max_stocks]
 
         total = len(stock_list)
-        all_dfs = []
-        failed = []
+        if total == 0:
+            return pd.DataFrame()
 
-        for i, code in enumerate(stock_list, 1):
-            try:
-                df = self.get_daily_price(code, start_date, end_date)
-                if not df.empty:
-                    all_dfs.append(df)
-                    print(f"  [{i}/{total}] {code} ✅")
-                else:
-                    print(f"  [{i}/{total}] {code} ⏭️ (空数据)")
-            except Exception as e:
-                failed.append(code)
-                print(f"  [{i}/{total}] {code} ❌ {type(e).__name__}")
+        print(f"  并发获取 {total} 只股票行情...")
+
+        def fetch_one(code):
+            return self.get_daily_price(code, start_date, end_date)
+
+        # 检查增量缓存：只拉取缺失的
+        prices_dir = os.path.join(self.cache_dir, "prices")
+        all_dfs = []
+        remaining = []
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        for code in stock_list:
+            cache_path = os.path.join(prices_dir, f"{code}.parquet")
+            if os.path.exists(cache_path):
+                try:
+                    meta = pd.read_parquet(cache_path)
+                    if not meta.empty:
+                        meta_date = pd.to_datetime(meta["date"])
+                        if meta_date.min() <= start_dt and meta_date.max() >= end_dt:
+                            subset = meta[(meta_date >= start_dt) & (meta_date <= end_dt)]
+                            if not subset.empty:
+                                all_dfs.append(subset)
+                                continue
+                except Exception:
+                    pass
+            remaining.append(code)
+
+        if remaining:
+            print(f"  缓存命中 {len(all_dfs)}/{total}，仍需获取 {len(remaining)} 只")
+            success, failed = _batch_fetch(
+                remaining,
+                fetch_one,
+                "行情",
+                max_workers=CONCURRENT_WORKERS,
+            )
+            all_dfs.extend(success)
+        else:
+            print(f"  全部缓存命中! {len(all_dfs)}/{total}")
 
         if all_dfs:
             result = pd.concat(all_dfs, ignore_index=True)
             print(f"\n成功: {len(all_dfs)} / {total} 只股票")
-            if failed:
-                print(f"失败: {len(failed)} 只: {failed[:5]}...")
             return result
         return pd.DataFrame()
 
@@ -254,17 +373,17 @@ class AStockDataFetcher:
     # ──────────────────────────────────────────
 
     def get_universe(self, date: str = None) -> list:
-        """获取符合筛选条件的股票池 (仅简单排除北交所)"""
+        """获取符合筛选条件的股票池 (排除北交所、科创板)"""
         stocks = self.get_stock_list()
         codes = stocks["stock_code"].tolist()
 
         result = []
         for code in codes:
-            if code.startswith("8") or code.startswith("4") or code.startswith("9"):
+            if code.startswith("8") or code.startswith("4") or code.startswith("9") or code.startswith("688"):
                 continue
             result.append(code)
 
-        print(f"股票池: {len(result)} 只 (已排除北交所)")
+        print(f"股票池: {len(result)} 只 (排除北交所、科创板)")
         return result
 
     # ──────────────────────────────────────────
@@ -273,34 +392,46 @@ class AStockDataFetcher:
 
     def enrich_with_financial_data(self, price_df: pd.DataFrame) -> pd.DataFrame:
         """
-        获取财务指标并合并到行情数据中
-
-        为每个股票获取季度财务报告，前向填充到每个交易日，
-        合并为带财务指标的完整DataFrame
+        获取财务指标并合并到行情数据中（并发版）
 
         Returns:
             新增列: roe, roa, gross_margin, net_margin,
-                    eps_ttm, bvps, pe_ttm, pb,
-                    revenue_yoy, profit_yoy
+                    eps_ttm, bvps, pe_ttm, pb, revenue_yoy, profit_yoy
         """
         stock_codes = price_df["stock_code"].unique()
-        print(f"\n[财务] 获取 {len(stock_codes)} 只股票的财务数据...")
-        all_parts = []
+        total = len(stock_codes)
+        print(f"\n[财务] 并发获取 {total} 只股票的财务数据...")
 
-        for i, code in enumerate(stock_codes, 1):
-            stock_data = price_df[price_df["stock_code"] == code].sort_values("date").copy()
+        # 预分组：按股票代码切分 price_df
+        stock_groups = {
+            code: g.sort_values("date")
+            for code, g in price_df.groupby("stock_code")
+        }
+
+        fin_cache_dir = os.path.join(self.cache_dir, "fin_cache")
+        os.makedirs(fin_cache_dir, exist_ok=True)
+
+        def fetch_and_merge(code):
+            """获取单只股票的财务数据并合并"""
+            stock_data = stock_groups[code]
+            cache_path = os.path.join(fin_cache_dir, f"{code}.parquet")
+            if os.path.exists(cache_path):
+                merged = pd.read_parquet(cache_path)
+                # 只取与原始数据日期范围匹配的行
+                merged = merged[merged["date"].isin(stock_data["date"])]
+                if not merged.empty:
+                    return merged
+
             try:
-                fin_raw = self.get_financial_indicators(code)
+                time.sleep(0.15)
+                fin_raw = ak.stock_financial_abstract(symbol=code)
                 if fin_raw.empty:
-                    all_parts.append(stock_data)
-                    continue
+                    return stock_data
 
                 fin_ts = self._parse_financial_to_ts(fin_raw)
                 if fin_ts.empty:
-                    all_parts.append(stock_data)
-                    continue
+                    return stock_data
 
-                # 使用 merge_asof 前向填充：每个交易日取最新季度数据
                 merged = pd.merge_asof(
                     stock_data,
                     fin_ts.sort_values("report_date"),
@@ -308,22 +439,30 @@ class AStockDataFetcher:
                     right_on="report_date",
                     direction="backward",
                 )
-                # 计算 PE/PB 等衍生指标
                 merged = self._calc_derived_factors(merged)
-                # 删除冗余字段
                 for col in ["report_date", "eps", "revenue", "net_profit"]:
                     if col in merged.columns:
                         merged.drop(columns=[col], inplace=True)
 
-                all_parts.append(merged)
-                print(f"  [财务/{i}/{len(stock_codes)}] {code} ✅")
-            except Exception as e:
-                all_parts.append(stock_data)
-                print(f"  [财务/{i}/{len(stock_codes)}] {code} ⚠️ {type(e).__name__}")
-                continue
+                merged.to_parquet(cache_path, index=False)
+                return merged
+            except Exception:
+                return stock_data
 
-        result = pd.concat(all_parts, ignore_index=True)
-        print(f"  [财务] 已合并: {result.shape[0]} 行, {result.shape[1]} 列")
+        success, errors = _batch_fetch(
+            list(stock_codes),
+            fetch_and_merge,
+            "财务",
+            max_workers=min(CONCURRENT_WORKERS, 8),
+        )
+
+        if errors:
+            # 失败的用原始价格数据兜底
+            for code in errors:
+                success.append(stock_groups[code])
+
+        result = pd.concat(success, ignore_index=True)
+        print(f"\n  [财务] 已合并: {result.shape[0]} 行 × {result.shape[1]} 列 ({total} 只)")
         return result
 
     def _parse_financial_to_ts(self, fin_df: pd.DataFrame) -> pd.DataFrame:

@@ -87,7 +87,7 @@ class FactorPipeline:
 
     def prepare_data(
         self, start_date: str = None, end_date: str = None,
-        max_stocks: int = 200, with_financial: bool = True,
+        max_stocks: int = -1, with_financial: bool = True,
     ):
         """
         准备分析所需数据
@@ -100,17 +100,12 @@ class FactorPipeline:
         end = end_date or BACKTEST_CONFIG["end_date"]
 
         print(f"[1/3] 获取全A股股票池...")
-        full_list = self.fetcher.get_universe(end)
-        # 过滤科创板 (688) 和北交所
-        filtered = [c for c in full_list if not c.startswith("688")]
-        print(f"  全市场 {len(full_list)} 只, 过滤后 {len(filtered)} 只")
+        sample = self.fetcher.get_universe(end)
+        print(f"  可用 {len(sample)} 只 (已排除北交所、科创板)")
 
         if max_stocks > 0:
-            sample = filtered[:max_stocks]
-            print(f"  取前 {len(sample)} 只作为样本")
-        else:
-            sample = filtered
-            print(f"  全市场选股: {len(sample)} 只")
+            sample = sample[:max_stocks]
+            print(f"  取前 {len(sample)} 只")
 
         print(f"[2/3] 获取行情数据 ({start} ~ {end})...")
         price_df = self.fetcher.get_all_daily_price(

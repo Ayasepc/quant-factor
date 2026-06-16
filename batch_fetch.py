@@ -19,22 +19,23 @@ import pandas as pd
 from data_fetcher import AStockDataFetcher, REQUEST_INTERVAL
 
 START = "2026-01-01"
-END = "2026-06-12"
+END = "2026-06-15"
 
 
 def get_missing_stocks(fetcher, priority_prefix="688"):
     """获取未缓存股票列表，按优先级排序"""
     stocks = fetcher.get_stock_list()
     codes = stocks["stock_code"].tolist()
-    codes = [c for c in codes if not c.startswith("8")]  # 排除北交所
+    codes = [c for c in codes if not c.startswith(("8", "4", "9", "688"))]  # 排除北交所、科创板
 
     cached = set()
     import glob
-    for path in glob.glob(os.path.join(fetcher.cache_dir, "price_*.parquet")):
-        cached.add(os.path.basename(path).split("_")[1])
+    prices_dir = os.path.join(fetcher.cache_dir, "prices")
+    if os.path.isdir(prices_dir):
+        for path in glob.glob(os.path.join(prices_dir, "*.parquet")):
+            cached.add(os.path.splitext(os.path.basename(path))[0])
 
     missing = [c for c in codes if c not in cached]
-    # 优先级排序: 688 > 深市 > 其他沪市
     priority = [c for c in missing if c.startswith(priority_prefix)]
     others = [c for c in missing if not c.startswith(priority_prefix)]
     print(f"已缓存: {len(cached)}, 待获取: {len(missing)}")
